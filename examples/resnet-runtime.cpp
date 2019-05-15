@@ -59,7 +59,6 @@ llvm::cl::opt<BackendKind> backend(
                      clEnumValN(BackendKind::OpenCL, "opencl", "Use OpenCL"),
                      clEnumValN(BackendKind::Habana, "habana", "Use Habana")),
     llvm::cl::init(BackendKind::CPU), llvm::cl::cat(category));
-
 std::mutex eventLock;
 std::unique_ptr<TraceContext> traceContext;
 
