@@ -63,16 +63,6 @@ llvm::cl::opt<bool>
             llvm::cl::desc("Specify whether to run with verbose output"),
             llvm::cl::Optional, llvm::cl::cat(loaderCat));
 
-llvm::cl::opt<bool>
-    timeOpt("time",
-            llvm::cl::desc("Print timer output to stderr detailing how long it "
-                           "takes for the program to execute"),
-            llvm::cl::Optional, llvm::cl::cat(loaderCat));
-
-llvm::cl::opt<unsigned> iterationsOpt(
-    "iterations", llvm::cl::desc("Number of iterations to perform"),
-    llvm::cl::Optional, llvm::cl::init(1), llvm::cl::cat(loaderCat));
-
 llvm::cl::opt<std::string> dumpProfileFileOpt(
     "dump-profile",
     llvm::cl::desc("Perform quantization profiling for a given graph "
@@ -199,6 +189,18 @@ llvm::cl::opt<unsigned> numDevices("num-devices",
                                    llvm::cl::cat(loaderCat));
 } // namespace
 
+// timeOpt and iterationsOpt are outside the namespace so they can be used by
+// the image-classifier.
+llvm::cl::opt<bool>
+    timeOpt("time",
+            llvm::cl::desc("Print timer output to stderr detailing how long it "
+                           "takes for the program to execute"),
+            llvm::cl::Optional, llvm::cl::cat(loaderCat));
+
+llvm::cl::opt<unsigned> iterationsOpt(
+    "iterations", llvm::cl::desc("Number of iterations to perform"),
+    llvm::cl::Optional, llvm::cl::init(0), llvm::cl::cat(loaderCat));
+
 llvm::StringRef Loader::getModelOptPath() {
   assert(modelPathOpt.size() == 1 &&
          llvm::sys::fs::is_directory(*modelPathOpt.begin()) &&
@@ -211,10 +213,12 @@ bool glow::emittingBundle() { return !emitBundle.empty(); }
 bool glow::profilingGraph() { return !dumpProfileFileOpt.empty(); }
 
 static bool commandLineIsInvalid() {
-  if (!dumpProfileFileOpt.empty() && !loadProfileFileOpt.empty()) {
-    llvm::errs() << "Loader: the -" << dumpProfileFileOpt.ArgStr << " and -"
-                 << loadProfileFileOpt.ArgStr
-                 << " options may not be specified together.\n";
+  if (!dumpProfileFileOpt.empty() &&
+      (!loadProfileFileOpt.empty() || convertToFP16)) {
+    llvm::errs() << "Loader: the -" << dumpProfileFileOpt.ArgStr
+                 << " option cannot be specified at the same time as either -"
+                 << loadProfileFileOpt.ArgStr << " or -" << convertToFP16.ArgStr
+                 << ".\n";
     return true;
   }
 
@@ -273,89 +277,43 @@ void Loader::compile(PlaceholderBindings &bindings) {
     F_->dumpDAG(dumpGraphDAGFileBeforeCompilationOpt.c_str());
   }
 
-  // Fold low-level operators into higher-level operators.
-  // This is useful when compiling an input model where some high-level
-  // operators have been lowered (this can be for instance a side effect of
-  // model converters, like converters from Tensorflow to ONNX). In this
-  // situation, such folding can then enable more optimizations and also improve
-  // the performance backends that support natively such high-level operators.
-  ::fold(F_, glow::CompilationMode::Infer);
+  CompilationContext cctx{&bindings, &loweredMap_};
+  PrecisionConfiguration &precConfig = cctx.precisionConfig;
 
   // Handle the request to profile the graph in preparation for quantization.
   if (!dumpProfileFileOpt.empty()) {
-    // Perform the high-level optimizations before instrumenting the graph. This
-    // optimization phase will remove stuff like repetitive transpose operations
-    // perform CSE, etc.
-    ::optimize(F_, glow::CompilationMode::Infer);
+    precConfig.quantMode = QuantizationMode::Profile;
 
     // By default everything will be lowered for profiling. However this may
     // cause performance issues for some models, e.g. if a model has group
     // Convolutions which explode the size of the graph when lowered. Thus allow
     // for disabling certain NodeKinds for profiling. This means that during
     // quantization, these nodes should also not be lowered by the backend.
-    KindSet doNotLowerNodesForProfiling;
     for (llvm::StringRef kindName : doNotLowerNodesForProfilingOpt) {
-      doNotLowerNodesForProfiling.insert(getKindFromNodeName(kindName));
+      precConfig.precisionModeKindSet.insert(getKindFromNodeName(kindName));
     }
-
-    // Lower everything, keeping track of what NodeValues were lowered to other
-    // NodeValues via the loweredMap_. This loweredMap_ is passed to
-    // generateNodeQuantizationInfos() when writing out the profile, allowing
-    // for both lowered and unlowered NodeValues to find their quantization
-    // parameters.
-    ::lower(F_, &loweredMap_, /* backend */ nullptr,
-            doNotLowerNodesForProfiling);
-
-    // Instrument the graph to capture profiles for nodes' outputs.
-    ::profileQuantization(bindings, F_);
+  } else {
+    // By default, when converting models, all nodes that can be converted are
+    // converted. However, some models may need to keep higher precision for
+    // some nodes to prevent high accuracy loss. Those nodes are gathered via
+    // the keepOriginalPrecisionForNodesOpt option and passed to the related
+    // conversion function.
+    for (llvm::StringRef kindName : keepOriginalPrecisionForNodesOpt) {
+      precConfig.precisionModeKindSet.insert(getKindFromNodeName(kindName));
+    }
   }
 
-  // By default, when converting models, all nodes that can be
-  // converted are converted. However, some models may need to
-  // keep higher precision for some nodes to prevent high accuracy loss.
-  // Those nodes are gathered via the keepOriginalPrecisionForNodesOpt
-  // option and passed to the related conversion function.
-  KindSet keepOriginalPrecisionForNodes;
-  for (llvm::StringRef kindName : keepOriginalPrecisionForNodesOpt) {
-    keepOriginalPrecisionForNodes.insert(getKindFromNodeName(kindName));
-  }
-
-  // Load the quantization profile and transform the graph.
   if (!loadProfileFileOpt.empty()) {
-    // The profiled graph was optimized before it was instrumentated. In this
-    // part of the code we repeat the same transformation in order to create
-    // the same graph structure.
-    ::optimize(F_, glow::CompilationMode::Infer);
-
-    // Lower as the backend prefers. When generating the profile everything was
-    // lowered, however all lowered and unlowered components have a profile, and
-    // so the backend can lower however it prefers and always find all of its
-    // NodeValue's quantization parameters.
-    ::lower(F_, &loweredMap_, backend_);
-
-    quantization::QuantizationConfiguration quantConfig{
-        deserializeFromYaml(loadProfileFileOpt)};
-
-    // Quantize the graph based on the captured profile.
-    quantConfig.precision = quantizationPrecision;
-    quantConfig.schema = quantizationSchema;
-    quantConfig.enableRowwise = enableRowwiseOpt;
-    quantConfig.assertAllNodesQuantized = assertAllNodesQuantizedOpt;
-
-    quantization::quantizeFunction(F_, quantConfig, *backend_, loweredMap_,
-                                   keepOriginalPrecisionForNodes);
+    precConfig.quantMode = QuantizationMode::Quantize;
+    precConfig.quantConfig.precision = quantizationPrecision;
+    precConfig.quantConfig.infos = deserializeFromYaml(loadProfileFileOpt);
+    precConfig.quantConfig.schema = quantizationSchema;
+    precConfig.quantConfig.enableRowwise = enableRowwiseOpt;
+    precConfig.quantConfig.assertAllNodesQuantized = assertAllNodesQuantizedOpt;
   }
 
-  if (convertToFP16) {
-    TypeAToTypeBFunctionConverter converter(*F_, ElemKind::FloatTy,
-                                            ElemKind::Float16Ty,
-                                            &keepOriginalPrecisionForNodes);
-    converter.convert();
-    ::optimize(F_, glow::CompilationMode::Infer);
-  }
+  precConfig.convertToFP16 = convertToFP16;
 
-  CompilationContext cctx;
-  cctx.mode = CompilationMode::Infer;
   // Store a raw pointer to the Module, we pass the unique_ptr to HostManager
   // but the Module is stored by Hostmanager so the pointer will remain valid.
   auto module = M_.get();
@@ -367,8 +325,7 @@ void Loader::compile(PlaceholderBindings &bindings) {
     backend_->save(F_, emitBundle, networkName);
   } else {
     // Emit IR for the graph and compile it.
-    auto error = hostManager_->addNetwork(std::move(M_), /*saturateHost*/ false,
-                                          profilingGraph());
+    auto error = hostManager_->addNetwork(std::move(M_), cctx);
     EXIT_ON_ERR(std::move(error));
   }
   if (dumpGraphOpt) {
@@ -388,12 +345,12 @@ void Loader::compile(PlaceholderBindings &bindings) {
 void Loader::runInference(PlaceholderBindings &bindings, size_t batchSize) {
   assert(!emittingBundle() &&
          "No inference is performed in the bundle generation mode.");
-
+  unsigned iterations = iterationsOpt == 0 ? 1 : iterationsOpt;
   llvm::Timer timer("Infer", "Infer");
   if (timeOpt) {
     timer.startTimer();
   }
-  for (unsigned i = 0; i < iterationsOpt; i++) {
+  for (unsigned i = 0; i < iterations; i++) {
     auto runErr = hostManager_->runNetworkBlocking(modelPathOpt[0], bindings);
     EXIT_ON_ERR(std::move(runErr));
   }
@@ -401,7 +358,7 @@ void Loader::runInference(PlaceholderBindings &bindings, size_t batchSize) {
     timer.stopTimer();
     llvm::outs() << llvm::formatv("Wall time per item (s): {0:f4}\n",
                                   timer.getTotalTime().getWallTime() /
-                                      iterationsOpt / batchSize);
+                                      iterations / batchSize);
   }
 }
 
@@ -452,4 +409,5 @@ Loader::Loader(int argc, char **argv) {
   hostManager_ = llvm::make_unique<runtime::HostManager>(std::move(configs));
   backend_ = createBackend(ExecutionBackend);
   F_ = M_->createFunction(modelPathOpt[0]);
+  functionName_ = modelPathOpt[0];
 }

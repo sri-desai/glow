@@ -33,9 +33,8 @@ static void fillStableRandomData(Handle<float> H, size_t seed,
   }
 }
 
-// Fills the tensor \p H with some stable random integers with the seed \p
-// seed
-/// and the range [0, scale).
+/// Fills the tensor \p H with some stable random integers with the seed \p
+/// seed and the range [0, scale).
 template <typename T>
 static void fillStableRandomIndex(Handle<T> H, size_t seed, size_t min = 0,
                                   size_t max = 10) {
@@ -123,7 +122,7 @@ protected:
 
     numberOfSparseTables = 10;
     tableSizes = {8000, 6000, 7000, 9000, 12000, 8000, 6000, 7000, 9000, 12000};
-    deviceMemCapacity = 1024 * 1024 * 6; // 10M.
+    deviceMemCapacity = 1024 * 1024 * 6; // 6 MB.
 
     numDevices = 6;
   }
@@ -412,6 +411,8 @@ protected:
 
     // Interacting sparse and dense
     embeddings.push_back(RL);
+    std::cout << "Number of embeddings concatenated: " << embeddings.size()
+              << std::endl;
     auto *CN = F_->createConcat("concat", embeddings,
                                 1); // Output is size {MB, emb_dim*n}
     auto *reshaped = F_->createReshape(
@@ -446,7 +447,8 @@ protected:
     return;
   }
 
-  void testRecSys(bool quantizeSLWS, bool quantizeFC, bool convertToFP16) {
+  void testRecSys(bool quantizeSLWS, bool quantizeFC, bool convertToFP16,
+                  bool checkConcat = false) {
     // Create the tables.
     std::vector<Placeholder *> sparseLengths(numberOfSparseTables);
     for (unsigned int i = 0; i < sparseLengths.size(); i++) {
@@ -465,24 +467,53 @@ protected:
     SaveNode *result1 = llvm::cast<SaveNode>(F_->getNodeByName("save"));
     result = result1->getPlaceholder();
 
+    Placeholder *concatPH = nullptr;
+    if (checkConcat) {
+      // Add an observer node after concat.
+      auto *CN = F_->getNodeByName("concat");
+      auto *saveConcat = F_->createSave("after_concat_data", CN);
+      concatPH = saveConcat->getPlaceholder();
+    }
+
+    CompilationContext cctx;
     if (convertToFP16) {
-      KindSet keepOriginalPrecisionForNodes;
-      keepOriginalPrecisionForNodes.insert(
+      PrecisionConfiguration &precConfig = cctx.precisionConfig;
+      precConfig.convertToFP16 = convertToFP16;
+      precConfig.precisionModeKindSet.insert(
           Kinded::Kind::FusedRowwiseQuantizedSparseLengthsWeightedSumNodeKind);
-      keepOriginalPrecisionForNodes.insert(
+      precConfig.precisionModeKindSet.insert(
           Kinded::Kind::RowwiseQuantizedFullyConnectedNodeKind);
-      TypeAToTypeBFunctionConverter converter(*F_, ElemKind::FloatTy,
-                                              ElemKind::Float16Ty,
-                                              &keepOriginalPrecisionForNodes);
-      converter.convert();
-      ::optimize(F_, glow::CompilationMode::Infer);
     }
 
     // Compile.
-    EE_.compile(CompilationMode::Infer, F_);
+    EE_.compile(F_, cctx);
 
     // Run graph
     EE_.run(bindings_);
+
+    if (checkConcat) {
+      // Get result and verify.
+      auto *resultTensor = bindings_.get(result);
+      auto resultHandle = resultTensor->getHandle();
+
+      EXPECT_EQ(resultTensor->size(), miniBatch);
+
+      auto *concatT = bindings_.get(concatPH);
+      auto concatH = concatT->getHandle();
+      // Check that intermediate concat results didn't overflow.
+      std::cout << "Intermediate concats" << std::endl;
+      concatH.dump();
+      for (int i = 0, e = concatH.size(); i < e; ++i) {
+        EXPECT_LE(fabs(concatH.raw(i)), 100);
+      }
+
+      std::cout << "Result of prediction" << std::endl;
+      std::cout << resultHandle.size() << std::endl;
+      resultHandle.dump();
+      for (int i = 0, e = resultHandle.size(); i < e; ++i) {
+        EXPECT_GE(resultHandle.raw(i), 0.0);
+      }
+    }
   }
 
   /// Execute a graph of functions based on the given DAG.
@@ -545,6 +576,33 @@ protected:
 
     Tensor *resultTensor = bindings.get(result);
     EXPECT_TRUE(referenceResult.isEqual(*resultTensor));
+  }
+
+  /// Test SparseLengthsSum independently.
+  void testSLSQuant() {
+    std::vector<Placeholder *> sparseLengths(1);
+    sparseLengths[0] =
+        mod_.createPlaceholder(ElemKind::Int32ITy, {miniBatch}, "SL0", false);
+
+    std::vector<NodeValue> embeddings(sparseLengths.size());
+    createSparseEmbeddings(mod_, bindings_, F_, sparseLengths, tableSizes,
+                           embeddingDim, embeddings, true);
+
+    auto *save = F_->createSave("save", embeddings[0]);
+    bindings_.allocate(save->getPlaceholder());
+
+    SaveNode *result1 = llvm::cast<SaveNode>(F_->getNodeByName("save"));
+    result = result1->getPlaceholder();
+
+    EE_.compile(CompilationMode::Infer, F_);
+
+    // Run graph
+    EE_.run(bindings_);
+    auto *resultTensor = bindings_.get(result);
+
+    // TODO: for now we only check the output dimension, contents are ignored
+    EXPECT_EQ(resultTensor->size(), miniBatch * embeddingDim);
+    resultTensor->getHandle().dump();
   }
 };
 
@@ -664,4 +722,11 @@ TEST_P(RecommendationSystemTest, RecSys_Partitioned_RWQuantized_SLWS_FC_FP16) {
 
   runPartitionedGraph(numDevices, deviceMemCapacity,
                       bindings_.get(result)->clone(), bindings_);
+}
+
+/// Test SLS independently, with no other layers being run.
+TEST_P(RecommendationSystemTest, RecSys_SLS_Only) {
+  ENABLED_BACKENDS(CPU, Habana);
+
+  testSLSQuant();
 }
