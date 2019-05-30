@@ -116,8 +116,8 @@ llvm::Error HabanaDeviceManager::init() {
 llvm::Error HabanaDeviceManager::updateMemoryUsage() {
   // TODO: Use synGetMemInfo once implemented.
 
-  totalMemory_ = GlowHabanaMemory * 1024;
-  freeMemory_ = GlowHabanaMemory * 1024;
+  totalMemory_ = uint64_t{GlowHabanaMemory} * 1024;
+  freeMemory_ = uint64_t{GlowHabanaMemory} * 1024;
 
   // Account for the size used by each function loaded on the card.
   for (const auto &pr : functions_) {
@@ -298,7 +298,12 @@ void HabanaDeviceManager::runFunctionImpl(RunIdentifierTy runId,
       llvm::make_unique<HabanaBindings>(deviceId_, topologyId);
   deviceBindings->setIOBuffer(ioBufferPool->get());
   ctx->setDeviceBindings(std::move(deviceBindings));
-  function->execute(ctx.get());
+
+  auto executeErr = function->execute(ctx.get());
+  if (executeErr) {
+    resultCB(runId, std::move(executeErr), std::move(ctx));
+    return;
+  }
 
   // Give the handle to the wait thread pool to wait on and call the callback
   // for.

@@ -38,9 +38,8 @@ llvm::raw_ostream &errs();
 llvm::raw_ostream &dbgs();
 
 /// Stream LLVM's ArrayRef into the given output stream.
-template <typename E>
-llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
-                              const llvm::ArrayRef<E> list) {
+template <typename Stream, typename E>
+Stream &operator<<(Stream &os, const llvm::ArrayRef<E> list) {
   os << '[';
   // Print the array without a trailing comma.
   for (size_t i = 0, e = list.size(); i < e; i++) {
@@ -118,6 +117,31 @@ inline void report(llvm::StringRef str) { report(str.data()); }
 /// and constants should look like valid C identifiers. Therefore, those symbols
 /// can be inspected under debugger.
 std::string legalizeName(llvm::StringRef name);
+
+/// Data structure for multi string format used in yaml file.
+struct MultiLineStr {
+  std::string str;
+};
+
+/// Data structure used to read the yaml file for Device Configs.
+struct DeviceConfigHelper {
+  /// Device Name.
+  std::string name_;
+  /// BackendKind name.
+  std::string kindName_;
+  /// A string with multi lines. Each line represents a param.
+  MultiLineStr parameters_;
+  DeviceConfigHelper() = default;
+  DeviceConfigHelper(std::string &name, std::string &kindName)
+      : name_(name), kindName_(kindName) {}
+  DeviceConfigHelper(std::string &kindName, std::string &name,
+                     MultiLineStr &parameters)
+      : name_(name), kindName_(kindName), parameters_(parameters) {}
+};
+
+/// Deserialize quantization infos from the file \p fileName.
+std::vector<DeviceConfigHelper>
+deserializeDeviceConfigFromYaml(llvm::StringRef fileName);
 
 /// Printf-like formatting for std::string.
 const std::string strFormat(const char *format, ...)
