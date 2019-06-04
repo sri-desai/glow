@@ -93,55 +93,6 @@ static std::string getKernelName(llvm::StringRef kernelBase, ElemKind kind) {
 }
 
 namespace {
-/// Parameters for pooling operation.
-struct synPoolParams {
-  // Padding
-  int pWbegin;
-  int pWend;
-  int pHbegin;
-  int pHend;
-  // Kernel
-  int kW;
-  int kH;
-  // Stride
-  int sW;
-  int sH;
-  // Dilation
-  int dilW;
-  int dilH;
-  int poolingConvention;
-
-  synPoolParams()
-      : pWbegin(0), pWend(0), pHbegin(0), pHend(0), kW(1), kH(1), sW(1), sH(1),
-        dilW(1), dilH(1), poolingConvention(0) {}
-};
-
-/// Habana Synapse device.
-class Device final {
-  /// Device identifier, used for Synapse API calls.
-  uint32_t id_;
-
-public:
-  /// Initialize the device.
-  Device() {
-    chk(synInitialize());
-    chk(synAcquireDevice(&id_, nullptr));
-  }
-
-  /// Destroy the device.
-  ~Device() { chk(synDestroy()); }
-
-  /// Non-copyable, non-movable.
-  ///@{
-  Device(const Device &) = delete;
-  Device(Device &&) = delete;
-  Device &operator=(const Device &) = delete;
-  Device &operator=(Device &&) = delete;
-  ///@}
-
-  /// Get the stored identifier.
-  uint32_t getID() const { return id_; }
-};
 
 /// Enum describing how the tensor will be used by the model.
 enum class IOType {
@@ -411,7 +362,7 @@ bool HabanaWaitHandle::wait() {
 }
 
 /// Retrieve and dump debug info about a topology.
-void dumpTopologyInfo(uint32_t deviceId, uint64_t topologyId) {
+static void dumpTopologyInfo(uint32_t deviceId, uint64_t topologyId) {
   uint32_t numOfInputs;
   uint32_t numOfOutputs;
   uint32_t numOfIntermediates;
@@ -482,7 +433,7 @@ llvm::Error HabanaFunction::execute(ExecutionContext *context) {
     EnqueueTensorInfo eti;
     llvm::StringRef name = P->getName();
     eti.tensorName = name.data();
-    eti.tensorSize = T->getSizeInBytes();
+    eti.tensorSize = T->getUnpaddedSizeInBytes();
     eti.pTensorData = (char *)ioBuffer->get(P);
 
     copyInputsSizeInBytes += eti.tensorSize;
@@ -504,7 +455,7 @@ llvm::Error HabanaFunction::execute(ExecutionContext *context) {
     EnqueueTensorInfo eti;
     llvm::StringRef name = P->getName();
     eti.tensorName = name.data();
-    eti.tensorSize = T->getSizeInBytes();
+    eti.tensorSize = T->getUnpaddedSizeInBytes();
     eti.pTensorData = (char *)ioBuffer->get(P);
 
     outputInfo.push_back(eti);
@@ -564,26 +515,26 @@ static std::unique_ptr<synConvolutionParams> makeSynConvolutionParams(
   return params;
 }
 
-static std::unique_ptr<synPoolParams>
+static std::unique_ptr<ns_SpatialReduction::Params>
 makeSynPoolParams(llvm::ArrayRef<unsigned_t> kernel,
                   llvm::ArrayRef<unsigned_t> stride,
                   llvm::ArrayRef<unsigned_t> pad) {
-  auto params = llvm::make_unique<synPoolParams>();
+  auto params = llvm::make_unique<ns_SpatialReduction::Params>();
 
   // Kernel
-  params->kW = kernel[0];
-  params->kH = kernel[1];
+  params->kernel_w = kernel[0];
+  params->kernel_h = kernel[1];
   // Stride
-  params->sW = stride[0];
-  params->sH = stride[1];
+  params->stride_w = stride[0];
+  params->stride_h = stride[1];
   // Padding
-  params->pHbegin = pad[0];
-  params->pWbegin = pad[1];
-  params->pHend = pad[2];
-  params->pWend = pad[3];
+  params->pad_h_begin = pad[0];
+  params->pad_w_begin = pad[1];
+  params->pad_h_end = pad[2];
+  params->pad_w_end = pad[3];
   // Dilation
-  params->dilW = 1;
-  params->dilH = 1;
+  params->dilation_w = 1;
+  params->dilation_h = 1;
 
   return params;
 }
@@ -736,7 +687,7 @@ static bool usedInFunction(Placeholder *V, Function *F) {
   return false;
 }
 
-IOPlaceholders findIOPlaceholders(Function *F) {
+static IOPlaceholders findIOPlaceholders(Function *F) {
   IOPlaceholders io;
   for (auto &V : F->getParent()->getPlaceholders()) {
     if (!usedInFunction(V, F)) {
@@ -763,7 +714,7 @@ HabanaBackend::compile(Function *F, const BackendOptions &opts) const {
   // until the compilation is done.
   std::vector<std::unique_ptr<synConvolutionParams>> convParams;
   std::vector<std::unique_ptr<synTransposeParams>> transposeParams;
-  std::vector<std::unique_ptr<synPoolParams>> poolParams;
+  std::vector<std::unique_ptr<ns_SpatialReduction::Params>> poolParams;
   std::vector<std::unique_ptr<synFCParams>> fcParams;
   std::vector<std::unique_ptr<ns_FullyConnected::Params>> fcFp32Params;
   std::vector<std::unique_ptr<ns_Reduction::Params>> reductionParams;
@@ -898,7 +849,7 @@ HabanaBackend::compile(Function *F, const BackendOptions &opts) const {
     }
     case Kinded::Kind::MaxPoolNodeKind: {
       auto *PI = llvm::cast<MaxPoolNode>(&I);
-      std::unique_ptr<synPoolParams> params =
+      auto params =
           makeSynPoolParams(PI->getKernels(), PI->getStrides(), PI->getPads());
       chk(synCreateGenericNode(
           &tensors[PI->getInput()].get(), &tensors[PI].get(), 1, 1,
@@ -910,7 +861,7 @@ HabanaBackend::compile(Function *F, const BackendOptions &opts) const {
     }
     case Kinded::Kind::AvgPoolNodeKind: {
       auto *PI = llvm::cast<AvgPoolNode>(&I);
-      std::unique_ptr<synPoolParams> params =
+      auto params =
           makeSynPoolParams(PI->getKernels(), PI->getStrides(), PI->getPads());
       chk(synCreateGenericNode(
           &tensors[PI->getInput()].get(), &tensors[PI].get(), 1, 1,
@@ -1605,8 +1556,8 @@ bool surroundTileWithReshapes(Function *F, TileNode &tile) {
 
 } // namespace
 
-bool HabanaBackend::transformPostLowering(
-    Function *F, const CompilationContext &cctx) const {
+bool HabanaBackend::transformPostLowering(Function *F,
+                                          CompilationContext &cctx) const {
   bool changed = false;
   for (auto &node : F->getNodes()) {
     // Separate any Slice nodes into several that only slice in one dimension

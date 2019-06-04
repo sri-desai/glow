@@ -25,6 +25,7 @@
 #include "glow/Support/Random.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/Support/raw_ostream.h"
 
 namespace glow {
 
@@ -69,6 +70,11 @@ private:
   /// The TensorPool that is managing this Tensor (if any).
   TensorPool *tensorPool_{nullptr};
 
+  /// Size in bytes of the unpadded region memory. This is useful  communicating
+  /// the actual size of the data, this allows for copying only inputs and not
+  /// padding to the device.
+  size_t unpaddedSize_{0};
+
   template <class ElemTy> friend class Handle;
 
   /// \returns a pointer to the tensor data buffer.
@@ -77,6 +83,10 @@ private:
 public:
   /// \returns true if it is an unowned tensor.
   bool isUnowned() const { return isUnowned_; }
+
+  /// \returns the size of the unpadded memory region. If unpaddedSize_ is not
+  /// set return the size of the entire payload.
+  size_t getUnpaddedSizeInBytes() const;
 
   /// \returns the type of the tensor.
   const Type &getType() const { return type_; }
@@ -206,9 +216,11 @@ public:
 
   /// Construct an unowned tensor provided an existing payload buffer.
   /// This constructor can be used when there is a need to work with
-  /// "externally" managed payload buffers using Tensor APIs.
-  Tensor(void *data, TypeRef ty)
-      : data_(reinterpret_cast<char *>(data)), type_(*ty), isUnowned_{false} {
+  /// "externally" managed payload buffers using Tensor APIs. Additionally \p
+  /// unpaddedSize can be set to indicate actual size of the inputs.
+  Tensor(void *data, TypeRef ty, size_t unpaddedSize = 0)
+      : data_(reinterpret_cast<char *>(data)),
+        type_(*ty), isUnowned_{false}, unpaddedSize_{unpaddedSize} {
     // Mark as unowned.
     isUnowned_ = true;
   }
@@ -346,6 +358,27 @@ public:
     std::swap(tensorPool_, other.tensorPool_);
     return *this;
   }
+
+  /// Dump a textual representation of the Tensor into provided output stream.
+  void dump(llvm::raw_ostream &os) const;
+
+  /// Dump a textual representation of the Tensor into default output stream.
+  void dump() const;
+
+  /// Dump a textual representation of a specific number of elements in the
+  /// Tensor into provided output stream.
+  void dump(llvm::raw_ostream &os, unsigned maxNumElem) const;
+
+  /// Dump a textual representation of a specific number of elements in the
+  /// Tensor into default output stream.
+  void dump(unsigned maxNumElem) const;
+
+  /// Dump a textual representation of the Tensor to std::string.
+  std::string toString() const;
+
+  /// Dump a textual representation of a specific number of elements in the
+  /// Tensor to std::string.
+  std::string toString(unsigned maxNumElem) const;
 
   /// \returns true if the content of the other tensor \p other is identical to
   /// this one.
@@ -992,6 +1025,9 @@ template <class ElemTy> const Handle<ElemTy> Tensor::getHandle() const & {
   return Handle<ElemTy>(const_cast<Tensor *>(this));
 }
 
+llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Tensor &t);
+
+llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Tensor *t);
 } // namespace glow
 
 #endif // GLOW_BASE_TENSOR_H

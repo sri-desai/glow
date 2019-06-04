@@ -67,7 +67,7 @@ elif [[ "${CIRCLE_JOB}" == "TSAN" ]]; then
 elif [[ "$CIRCLE_JOB" == "RELEASE_WITH_EXPENSIVE_TESTS" ]]; then
     # Download the models and tell cmake where to find them.
     MODELS_DIR="$GLOW_DIR/downloaded_models"
-    DOWNLOAD_EXE="python $GLOW_DIR/utils/download_datasets_and_models.py --all-caffe2-models"
+    DOWNLOAD_EXE="python $GLOW_DIR/utils/download_datasets_and_models.py  -c resnet50 en2gr"
     mkdir $MODELS_DIR
     (
         cd $MODELS_DIR
@@ -75,6 +75,7 @@ elif [[ "$CIRCLE_JOB" == "RELEASE_WITH_EXPENSIVE_TESTS" ]]; then
     )
     CMAKE_ARGS+=("-DGLOW_MODELS_DIR=$MODELS_DIR")
     CMAKE_ARGS+=("-DGLOW_WITH_OPENCL=OFF")
+    CMAKE_ARGS+=("-DGLOW_WITH_BUNDLES=ON")
     CMAKE_ARGS+=("-DCMAKE_BUILD_TYPE=Release")
 elif [[ "$CIRCLE_JOB" == "COVERAGE" ]]; then
     sudo apt-get install wget 

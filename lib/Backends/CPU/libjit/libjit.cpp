@@ -1698,6 +1698,7 @@ libjit_dump_tensor(uint8_t *tensor, size_t *tensorDim, size_t numDimsTensor,
     FloatTy,       // 32-bit float type (float)
     Float16Ty,     // 16-bit float type (half, fp16)
     Int8QTy,       // 8-bit quantized type (int8_t)
+    UInt8QTy,      // unsigned 8-bit quantized type (uint8_t)
     Int16QTy,      // 16-bit quantized type (int16_t)
     Int32QTy,      // 32-bit quantized type (int32_t)
     Int32ITy,      // 32-bit index type (int32_t)
@@ -1731,7 +1732,7 @@ void libjit_write_timestamp(uint64_t *tensor, size_t offset) {
   // Issue #2397 covers migrating this to a libc approach but if you have issues
   // with a lack of C++ symbols at runtime check there first.
   uint64_t ts = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch())
+                    std::chrono::system_clock::now().time_since_epoch())
                     .count();
   memcpy(tensor + offset, &ts, sizeof(uint64_t));
 }

@@ -53,7 +53,8 @@ void HostManagerBackendId::runNetwork(const Graph *graph,
 }
 
 onnxStatus HostManagerBackendId::addNetwork(std::unique_ptr<Module> module) {
-  auto err = hostManager_->addNetwork(std::move(module));
+  CompilationContext cctx;
+  auto err = hostManager_->addNetwork(std::move(module), cctx);
 
   if (errToBool(std::move(err))) {
     return ONNXIFI_STATUS_INTERNAL_ERROR;
@@ -109,17 +110,18 @@ onnxStatus HostManagerGraph::run(std::unique_ptr<ExecutionContext> ctx,
       [outputEvent, traceEvents](runtime::RunIdentifierTy runId,
                                  llvm::Error err,
                                  std::unique_ptr<ExecutionContext> ctx) {
-        TRACE_EVENT_BEGIN(ctx->getTraceContext(), "Onnxifi::callback");
+        TRACE_EVENT_SCOPE(ctx->getTraceContext(), "Onnxifi::callback");
         // If an Error occurred then log it in errToBool and signal the output
         // event.
         if (errToBool(std::move(err))) {
           outputEvent->signal();
-          TRACE_EVENT_END(ctx->getTraceContext(), "Onnxifi::callback");
           return;
         }
 
-        // End the trace event before we convert TraceEvents to the ONNX format.
-        TRACE_EVENT_END(ctx->getTraceContext(), "Onnxifi::callback");
+        // End the current trace event before we convert TraceEvents to the ONNX
+        // format.
+        TRACE_EVENT_SCOPE_END();
+
         if (auto *traceContext = ctx->getTraceContext()) {
           setTraceEvents(traceEvents, traceContext);
 

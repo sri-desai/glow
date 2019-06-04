@@ -82,11 +82,26 @@ void InterpreterFunction::translateTraceEvents(
     assert(backingTensor);
 
     for (const TraceInfo::Event &event : backing.second) {
-      uint64_t ts{0};
-      memcpy(&ts,
-             backingTensor->getUnsafePtr() + (event.index * traceInfo.dataSize),
-             traceInfo.dataSize);
-      traceEvents.push_back({event.name, ts, event.type, tid});
+      // If it's a complete event: grab both timestamps.
+      if (event.type == TraceEvent::CompleteType) {
+        uint64_t start{0}, end{0};
+        memcpy(&start,
+               backingTensor->getUnsafePtr() +
+                   (event.startIndex * traceInfo.dataSize),
+               traceInfo.dataSize);
+        memcpy(&end,
+               backingTensor->getUnsafePtr() +
+                   (event.endIndex * traceInfo.dataSize),
+               traceInfo.dataSize);
+        traceEvents.push_back({event.name, start, end - start, tid});
+      } else {
+        uint64_t ts{0};
+        memcpy(&ts,
+               backingTensor->getUnsafePtr() +
+                   (event.startIndex * traceInfo.dataSize),
+               traceInfo.dataSize);
+        traceEvents.push_back({event.name, ts, event.type, tid});
+      }
     }
   }
 }
@@ -167,6 +182,23 @@ llvm::Error BoundInterpreterFunction::execute(IRFunction *F,
                                               ExecutionContext *context) {
   {
     auto ev = context->scopedEvent("registerTensors");
+
+    // Find all virtually padded tensors so they can be replaced.
+    std::vector<Placeholder *> virtualPadded;
+    for (auto &ph : context->getPlaceholderBindings()->pairs()) {
+      if (ph.second->getUnpaddedSizeInBytes() < ph.second->getSizeInBytes()) {
+        virtualPadded.push_back(ph.first);
+      }
+    }
+    // Replace all virtually padded tensors with real padding tensors.
+    for (auto &ph : virtualPadded) {
+      auto oldTensor = context->getPlaceholderBindings()->get(ph);
+      Tensor paddedTensor(oldTensor->getType());
+      memcpy(paddedTensor.getUnsafePtr(), oldTensor->getUnsafePtr(),
+             oldTensor->getUnpaddedSizeInBytes());
+      context->getPlaceholderBindings()->erase(ph);
+      context->getPlaceholderBindings()->insert(ph, std::move(paddedTensor));
+    }
     // Register the concrete tensors that back the placeholder tensors.
     for (auto &ph : context->getPlaceholderBindings()->pairs()) {
       auto *w = F->getWeightForNode(ph.first);

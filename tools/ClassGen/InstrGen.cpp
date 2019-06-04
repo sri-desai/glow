@@ -509,7 +509,6 @@ int main(int argc, char **argv) {
   BB.newInstr("ExtractTensor")
       .addOperand("Dest", OperandKind::Out)
       .addOperand("Src", OperandKind::In)
-      .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"})
       .addMember(MemberType::VectorSizeT, "Offsets");
 
   BB.newInstr("Gather")
@@ -641,7 +640,6 @@ int main(int argc, char **argv) {
   //===--------------------------------------------------------------------===//
 
 #include "Backends/CPU/CPUSpecificInstrs.h"
-#include "Backends/Habana/HabanaSpecificInstrs.h"
 #include "Backends/OpenCL/OpenCLSpecificInstrs.h"
   // Add here external backend specific instructions headers.
   // Example:
